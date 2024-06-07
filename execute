@@ -1,0 +1,709 @@
+#!/glide/bin/python27
+#
+# sncrun-NG
+# (C) 2011-2014 ServiceNow, Inc.
+# author/maintainer: Scott Stone <scott.stone@service-now.com>
+#
+# dependency upon /glide/bin/python27 is intentional.
+#
+"""
+SNCRun: Executes remote code or transfers files to remote systems,
+in parallel.  Integrates with SNC CMDB to choose hosts based on
+established criteria.
+(C) 2011-2014 ServiceNow, Inc.
+"""
+
+### INITIALIZATION
+
+## includes
+import os
+import sys
+import re
+import syslog
+import getopt
+import stat
+import datetime
+import warnings
+import getpass
+warnings.simplefilter("ignore")
+from ServiceNow import CMDB
+from fabric.api import env, hosts, run, sudo, task, hide, get, put, local
+from fabric.tasks import execute
+from fabric.api import *
+import fabric
+import subprocess
+
+# in-flight count
+rcountFile = "%s/sncrun.tracker" % (os.getenv("HOME"))
+try:
+    os.unlink(rcountFile)
+except:
+    pass
+
+# suppresses BS
+fabric.state.output['running'] = False
+
+## parameters
+SCRIPT_NAME = "sncrun"
+# note; 2.0.0 was the first python version
+SCRIPT_VERSION = "2.3.0"
+SCRIPT_COPYRIGHT = "(C) 2011-2018 ServiceNow, Inc."
+SCRIPT_AUTHOR = "Scott Stone <scott.stone@servicenow.com>"
+DEBUG = 0
+SUDO = 0
+LOGFILE = "%s/sncrun.log" % (os.getenv("HOME"))
+ENVPASS = "SSHPASS"
+YESMODE = 0
+COMMAND = None
+COPYDIRECTION = None
+QUERY = None
+QUIET = 0
+NORESULTS = 0
+CMDB_FQDN = "auto"
+CMDB_FQDN_FALLBACK = "datacenter.service-now.com"
+logger = None
+syslogger = None
+POOL_SIZE = 200
+SHOW_STDERR = 0
+USE_PTY = False
+PFX_PER_HOST = None
+TIMEOUT = 600
+
+## pre-initialize env
+env.user = os.getenv("USER")
+env.password = None
+env.hosts = list()
+env.parallel = True
+env.warn_only = True
+env.connection_attempts = 2
+env.timeout = 10
+env.abort_on_prompts = True
+
+### GLOBAL SUBROUTINES
+
+def usage():
+    """
+    Shows program usage and options.
+    """
+    print SCRIPT_NAME + " v" + SCRIPT_VERSION
+    print SCRIPT_COPYRIGHT
+    print "by " + SCRIPT_AUTHOR
+    print """
+Options:
+        * BASIC OPTIONS*
+        -h/--help                    = this message
+        -d/--debug                   = enable debug mode
+        -u/--username <username>     = specify ssh username (dfl: current user)
+        -p/--passwordfile <file>     = read password from <file>
+        -E/--envpass <var>           = read password from env <var> (dfl: SSHPASS)
+        -r/--remotehosts "<list>"    = remote hosts
+                                       comma or ws-separated quoted list
+        -i/--inputhosts <file>       = remote hosts from <file>, one per line
+        -q/--query "<encodedquery>"  = remote hosts from encoded CMDB
+                                       query string
+        -Q/--quiet                   = quiet mode (dfl=no)
+                                       when active, only hosts/result codes are
+                                       printed to stdout, not the output.
+                                       (log gets both)
+        -R/--noresults               = noresults mode (dfl=no)
+                                       when active, only the output is printed
+                                       to stdout, not status codes (log gets both)
+        -o/--output <prefix>         = prefix for results-per-host output
+                                       (also enables one-file-per-host for results)
+        -l/--log <file>              = write local log to <file>
+        -P/--parallel [0|1]          = parallel mode on/off (dfl: on)
+        -y/--yes                     = assume yes/non-interactive mode
+        -t/--threads <num>           = use <num> threads (dfl: %d)
+        -T/--timeout <seconds>       = set timeout. (dfl: %d seconds)
+        -S/--ServiceNow <fqdn>       = Use CMDB fqdn of <fqdn> 
+                                       (dfl: datacenter.service-now.com)
+
+        * SHELL COMMAND OPTIONS *
+        -s/--sudo                    = DEPRECATED - prefix cmd with 'pbrun'
+        -c/--command "<command>"     = remote command to run
+        -e/--show-stderr             = show stderr or not (dfl: no)
+        -x/--use-pty                 = allocate a pseudo-tty (dfl: no)
+                                       turning this on will always merge
+                                       stdout and stderr.
+
+        * SFTP OPTIONS *
+        -f/--local-files "<list>"    = local files to copy to/from (quoted)
+        -F/--remote-files "<list>"   = remote files to copy to/from (quoted)
+        -D/--copydirection [get|put] = specify copy direction (get/put)
+
+""" % (POOL_SIZE, TIMEOUT)
+
+def dbg(msg):
+    """
+    Writes a debugging message to appropriate facilities.
+    """
+    if (logger == None):
+        return
+    if (logger.DEBUG > 0):
+        logger.log(0, msg)
+
+def getPasswordFromFile(_fn):
+    """
+    Reads the user's password from the specified file.
+    """
+    if (logger != None):
+        dbg("reading password from '%s'"%(_fn))
+    try:
+        fp = os.stat(_fn)
+    except OSError:
+        return None
+    if ((fp.st_mode & stat.S_IRGRP) or
+        (fp.st_mode & stat.S_IROTH)):
+        print "warning: potentially unsafe permissions on pw file '%s'" % (_fn)
+    try:
+        fp = open(_fn)
+        pw = fp.readline().rstrip()
+        return pw
+    except OSError:
+        return None
+
+def getPasswordFromConsole():
+    """
+    Reads the user's password from STDIN.
+    """
+    print "Enter password for %s :: " % (env.user)
+    pw = getpass.getpass()
+    if (len(pw) == 0):
+        return None
+    return pw
+
+def getPasswordFromEnv():
+    """
+    Reads the user's password from os.getenv(ENVPASS)
+    """
+    pw = None
+    try:
+        pw = os.getenv(ENVPASS)
+        if (len(pw) == 0):
+            return None
+    except:
+        return None
+    return pw
+
+def getHostsFromFile(_fn):
+    """
+    Gets a list of hosts from a file, one per line.
+    """
+    if (logger != None):
+        dbg("reading host list from '%s'" % (_fn))
+    hostlist = list()
+    try:
+        fp = open(_fn)
+        buf = fp.readlines()
+        fp.close()
+        for i in buf:
+            hostlist.append(i.rstrip())
+    except (OSError, ValueError, TypeError):
+        hostlist = list()
+        return hostlist
+    return hostlist
+
+def getHostsFromQuery(q):
+    """
+    Gets a list of hosts from the result of a CMDB encoded query.
+    """
+    if (logger != None):
+        dbg("reading hosts from CMDB query '%s'" % (q))
+    hostlist = list()
+    try:
+        cmdb = CMDB(CMDB_FQDN, env.user, env.password)
+        qdata = cmdb.query(__limit=999999, __encoded_query=q)
+        if (qdata == None):
+            hostlist = list()
+            return hostlist
+        if (logger != None):
+            dbg("Got %d hosts in response to query." % (int(len(qdata))))
+        for fqdn in qdata:
+            hostlist.append(fqdn)
+    except (RuntimeError, TypeError, ValueError):
+        ea_info = sys.exc_info()
+        hostlist = list()
+        if (logger != None):
+            logger.log(2, "CMDB query error: %s %s" % (ea_info[0], ea_info[1]))
+    return hostlist
+    
+@task
+@hosts(env.hosts)
+@parallel(pool_size=POOL_SIZE)
+def runCommand():
+    """
+    Runs a command on remote hosts identified by @hosts (env.hosts)
+    """
+    global rcountFile
+    # gets COMMAND and SUDO from global context
+    h = env.host_string
+    try:
+        if (SUDO == 0):
+            if (DEBUG > 0):
+                result = run(COMMAND)
+            else:
+                with hide('running', 'stdout', 'stderr'):
+                    result = run(COMMAND, pty=USE_PTY, combine_stderr=False, timeout=TIMEOUT)
+        else:
+            if (DEBUG > 0):
+                result = sudo(COMMAND)
+            else:
+                with hide('running', 'stdout', 'stderr'):
+                    # sudo requires pty=True
+                    result = sudo(COMMAND, pty=True, combine_stderr=False, timeout=TIMEOUT)
+        rc = list()
+        rc.append(result.return_code)
+        rc.append(result.stdout)
+        rc.append(result.stderr)
+    except:
+        ea=sys.exc_info()
+        print "error on %s: %s" % ( h, ea[1] )
+        rc = 1024    
+    os.system("echo 1 >> %s" % (rcountFile))
+    completed = os.popen("cat %s | wc -l" % (rcountFile)).readlines()[0].rstrip()
+    print >> sys.stderr, "%s: completed. (%s of %s)" % (h, completed, len(env.hosts))
+    return rc
+
+@task
+@hosts(env.hosts)
+@parallel(pool_size=POOL_SIZE)
+def runSFTP():
+    """
+    Does an SFTP get/put (dependent on COPYDIRECTION),
+    to/from the remote hosts identified by @hosts (env.hosts)
+    """
+    # gets file parms from global context
+    h = env.host_string
+    if (COPYDIRECTION == 'get'):
+        with hide('running', 'stdout', 'stderr'):
+            mdresult = local("mkdir -p %s/%s" % (LOCALFILES, env.host_string))
+            if (mdresult.return_code != 0):
+                logger.log(2, "could not make local dir %s/%s" % (
+                        LOCALFILES, env.host_string))
+                print >> sys.stderr, "%s: completed." % (h)
+                return 1
+            result = get(REMOTEFILES, "%s/%s/" % (LOCALFILES, env.host_string))
+            if ((result.failed) and (len(result.failed) > 0)):
+                print >> sys.stderr, "%s: completed." % (h)
+                return 1
+            else:
+                print >> sys.stderr, "%s: completed." % (h)
+                return 0
+    elif (COPYDIRECTION == 'put'):
+        with hide('running', 'stdout', 'stderr'):
+            result = put(LOCALFILES, REMOTEFILES, use_sudo=SUDO)
+            if ((result.failed) and (len(result.failed) > 0)):
+                print >> sys.stderr, "%s: completed." % (h)
+                return 1
+            else:
+                print >> sys.stderr, "%s: completed." % (h)
+                return 0
+    else:
+        print >> sys.stderr, "%s: completed." % (h)
+        return 99
+    print >> sys.stderr, "%s: completed." % (h)
+    return 99
+    
+
+### CLASSES
+
+class l_Logger:
+    """
+    SNC Logging routines
+    """
+
+    appname = None
+    fp = None
+    logfile = None
+    openmode = None
+    DEBUG = 0
+    OVERWRITE = 0
+    SYSLOG = 0
+    FILE = 1
+    status = -1
+
+    def __init__(self, 
+                 _appname, 
+                 _syslog = 0, 
+                 _file = 1, 
+                 _overwrite = 0, 
+                 _debug = 0):
+        """ class constructor for l_Logger """
+        self.DEBUG = _debug
+        self.SYSLOG = _syslog
+        self.FILE = _file
+        self.appname = _appname
+        self.OVERWRITE = _overwrite
+        if (self.FILE == 1):
+            self.openLogFile()
+        if (self.SYSLOG == 1):
+            try:
+                syslog.openlog(self.appname, syslog.LOG_PID, syslog.LOG_LOCAL2)
+                self.status = 0
+            except (RuntimeError, ValueError, TypeError, AttributeError):
+                self.status = -1
+
+    def openLogFile(self):
+        """
+        Opens a file-based log target.
+        """
+        # open the logfile and store the filehandle locally
+        self.logfile = LOGFILE
+        self.openmode = 'a'
+        if (self.OVERWRITE > 0):
+            self.openmode = 'w'
+        try:
+            # open unbuffered to ensure log messages are flushed right away
+            self.fp = open(self.logfile, self.openmode, 0)
+            self.status = 0
+        except (RuntimeError, ValueError, TypeError, AttributeError, OSError):
+            ea = sys.exc_info()
+            print "Logfile failure: %s %s" % (ea[0], ea[1])
+            self.status = -1
+
+    def closeLogFile(self):
+        """
+        Closes a file-based log target.
+        """
+        if (self.fp != None):
+            self.fp.close()
+
+    def close(self):
+        """
+        Wrapper function around closeLogFile()
+        """
+        self.closeLogFile()
+
+    def logToFile(self, msg):
+        """
+        Logs to file-based log target.
+        """
+        if (self.FILE == 0):
+            return
+        if (self.fp == None):
+            self.openLogFile()
+        logmsg = "[%s]: %s\n" % (datetime.datetime.now().ctime(), msg)
+        try:
+            self.fp.write(logmsg)
+        except:
+            logmsg_err = "[%s]: undecodable message\n" % ( datetime.datetime.now().ctime() )
+
+    def logToStderr(self, msg):
+        """
+        Simple log to STDERR
+        """
+        msg += '\n'
+        sys.stderr.write(msg)
+
+    def logToStdout(self, msg):
+        """
+        Simple log to STDOUT
+        """
+        msg += '\n'
+        sys.stdout.write(msg)
+
+    def logToSyslog(self, level, msg):
+        """
+        Logs to syslog with appropriate priority/level
+        """
+        syslogLevel = syslog.LOG_DEBUG
+        if (level == 1):
+            syslogLevel = syslog.LOG_NOTICE
+        if (level == 2):
+            syslogLevel = syslog.LOG_ERR
+        syslog.syslog(syslogLevel, msg)
+
+    # levels: 0 = debug, 1 = normal, 2 = error
+    # do not append a trailing \n to messages.
+    def log(self, level, _msg):
+        """
+        Entrypoint 'log' function which sends the message
+        to configured logging facilities.
+        """
+        logmsg = None
+        try:
+            msg = unicode(_msg, 'iso8859-1')
+        except:
+            msg=_msg
+        if (self.SYSLOG == 1):
+            self.logToSyslog(level, msg)
+        if (level == 0):
+            logmsg = "DEBUG: %s" % (msg)
+            self.logToStderr(logmsg)
+            self.logToFile(logmsg)
+        elif (level == 1):
+            self.logToFile(msg)
+#            if (self.DEBUG > 0):
+#                self.logToStderr(msg)
+        elif (level == 2):
+            logmsg = "ERROR: %s" % (msg)
+            self.logToStderr(logmsg)
+            self.logToFile(logmsg)
+        else:
+            logmsg = "UNKNOWN: %s" % (msg)
+            self.logToFile(logmsg)
+
+### MAIN EXECUTION
+
+# do not allow this to be run as root:
+my_euid=os.geteuid()
+if (my_euid == 0):
+    print """
+FATAL: Cannot run sncrun as root or with sudo, for auditing purposes.
+       Please re-run this using your normal user ID instead.
+       Use the -s flag to run remote commands with sudo on the remote
+       systems to which you are connecting.
+"""
+    sys.exit(2)
+
+
+# open base logger:
+logger = l_Logger("sncrun", 0, 0, 1, 0)
+
+# process commandline arguments
+try:
+    opts, args = getopt.getopt(sys.argv[1:], 
+                               "hdu:p:E:r:i:q:QRo:l:P:yt:T:sc:f:F:D:S:ex",  [
+            "help", 
+            "debug", 
+            "username=", 
+            "passwordfile=",
+            "envpass=",
+            "remotehosts=", 
+            "inputhosts=", 
+            "query=", 
+            "quiet",
+            "noresults",
+            "output=", 
+            "log=", 
+            "parallel=", 
+            "yes", 
+            "threads=",
+            "timeout=",
+            "sudo", 
+            "command=", 
+            "local-files=", 
+            "remote-files=", 
+            "copydirection=", 
+            "ServiceNow=",
+            "show-stderr",
+            "use-pty"])
+except getopt.GetoptError, err:
+    print str(err)
+    usage()
+    sys.exit(2)
+
+for o, a in opts:
+    if o in ("-h", "--help"):
+        usage()
+        sys.exit()
+    elif o in ("-d", "--debug"):
+        DEBUG = 1
+    elif o in ("-u", "--username"):
+        env.user = a
+    elif o in ("-p", "--passwordfile"):
+        env.password = getPasswordFromFile(a)
+    elif o in ("-E", "--envpass"):
+        ENVPASS = a
+    elif o in ("-r", "--remotehosts"):
+        if (re.match('^.*,.*$', a)):
+            env.hosts = a.split(',')
+        else:
+            env.hosts = a.split()
+    elif o in ("-i", "--inputhosts"):
+        env.hosts = getHostsFromFile(a)
+    elif o in ("-q", "--query"):
+        QUERY = a
+    elif o in ("-o", "--output"):
+        PFX_PER_HOST = a
+    elif o in ("-l", "--log"):
+        LOGFILE = a
+    elif o in ("-P", "--parallel"):
+        if (int(a) == 0):
+            env.parallel = False
+        else:
+            env.parallel = True
+    elif o in ("-y", "--yes"):
+        YESMODE = 1
+    elif o in ("-s", "--sudo"):
+        print "sncrun: deprecated -s / --sudo flag present"
+        print "prefix the command you wish to run with 'pbrun' instead, e.g.:"
+	print "sncrun -q nameLIKEops -c 'pbrun whoami'"
+	print "to run the command with superuser privileges."
+	sys.exit(2)
+        SUDO = 0
+    elif o in ("-c", "--command"):
+        COMMAND = a
+    elif o in ("-f", "--local-files"):
+        LOCALFILES = a
+    elif o in ("-F", "--remote-files"):
+        REMOTEFILES = a
+    elif o in ("-D", "--copydirection"):
+        COPYDIRECTION = a
+    elif o in ("-S", "--ServiceNow"):
+        CMDB_FQDN = a
+    elif o in ("-Q", "--quiet"):
+        QUIET = 1
+    elif o in ("-R", "--noresults"):
+        NORESULTS = 1
+    elif o in ("-t", "--threads"):
+        POOL_SIZE = int(a)
+        env.pool_size=POOL_SIZE
+    elif o in ("-T", "--timeout"):
+        TIMEOUT = int(a)
+    elif o in ("-e", "--show-stderr"):
+        SHOW_STDERR = 1
+    elif o in ("-x", "--use-pty"):
+        USE_PTY = True
+
+# open logging
+logger = l_Logger("sncrun", 0, 1, 1, DEBUG)
+syslogger = l_Logger("sncrun", 1, 0, 1, DEBUG)
+if (logger.status != 0):
+    print "Could not open base logger object.  Cannot continue."
+    sys.exit(2)
+if (syslogger.status != 0):
+    print "Could not open syslogger object.  Cannot continue."
+    sys.exit(2)
+
+# autocheck CMDB FQDN:
+if ( CMDB_FQDN == "auto" ):
+    # cannot use facter for this since facter -p requires root
+    p = subprocess.Popen(['/usr/bin/facter','domain'], stdout=subprocess.PIPE)
+    mydomain = p.communicate()[0].strip()
+    if ( re.match ( '^(sea3|bfi3)\.service\-now\.com$', mydomain ) ):
+        CMDB_FQDN = "datacentertest.service-now.com"
+    elif ( re.match ( '^(sea|bfi).*\.service\-now\.com$', mydomain ) ):
+        CMDB_FQDN = "datacenterdev.service-now.com"
+    else:
+        CMDB_FQDN = CMDB_FQDN_FALLBACK
+    dbg ( "autodetected CMDB_FQDN = %s" % ( CMDB_FQDN ) )
+else:
+    dbg ( "using user-supplied CMDB_FQDN = %s" % ( CMDB_FQDN ) )
+
+dbg ( "Command timeout set to %d seconds." % ( TIMEOUT ) )
+
+# sanity check the input options provided
+if (env.user == None):
+    print "No username specified (-u)"
+    sys.exit(2)
+if (env.password == None):
+    pwEnv = getPasswordFromEnv()
+    if (pwEnv != None):
+        env.password = pwEnv
+    else:
+        env.password = getPasswordFromConsole()
+    if (env.password == None):
+        print "No valid password available."
+        sys.exit(2)
+if (QUERY != None):
+    dbg("Running CMDB query...")
+    env.hosts = getHostsFromQuery(QUERY)
+if (len(env.hosts) == 0):
+    print "No hosts specified by any method."
+    sys.exit(2)
+if (COMMAND == None):
+    if ((COPYDIRECTION == None) or
+        (LOCALFILES == None) or
+        (REMOTEFILES == None)):
+        print """SFTP mode requires copydirection, local-files, 
+and remote-files specified."""
+        sys.exit(2)
+    if ((COPYDIRECTION != "get") and (COPYDIRECTION != "put")):
+        print """SFTP mode requires a direction of 'get' or 'put',
+but never '%s'.""" % (COPYDIRECTION)
+        sys.exit(2)
+
+# get user confirmation
+if (SUDO == 1):
+    sudostr = "SUDO"
+else:
+    sudostr=""
+if (COMMAND != None):
+    auditstring = "User %s running as remote user %s (%s) on %d hosts, '%s', command '%s'" % (
+        os.getenv("USER"), env.user, sudostr, len(env.hosts), ','.join(env.hosts), COMMAND)
+else:
+    auditstring = "SFTP %s: user %s, remoteuser %s, hosts '%s', local '%s' remote '%s'" % (
+        COPYDIRECTION, os.getenv("USER"), env.user, ','.join(env.hosts), LOCALFILES, REMOTEFILES)
+if (YESMODE == 1):
+    dbg("Running in 'yes'/fast/no-confirmation mode.")
+else:
+    print auditstring
+    mypid=os.getpid()
+    print "Note: parent PID is %s" % (mypid)
+    print "Confirm? (must type 'yes'):"
+    confirmation = sys.stdin.readline().rstrip()
+    if (confirmation != 'yes'):
+        logger.log(2, "operation aborted by user.")
+        sys.exit(1)
+    else:
+        dbg("confirmation received.")
+syslogger.log(1, auditstring)
+logger.log(1, auditstring)
+if ((QUIET == 1) or (NORESULTS == 1)):
+    print "Results: (see %s for details)" % (LOGFILE)
+else:
+    print "Results:"
+logger.log(1, "Results:")
+rcount = len(env.hosts)
+if (COMMAND != None):
+    # we are running a shell command
+    try:
+        d = execute(runCommand)
+    except (OSError, 
+            RuntimeError, 
+            TypeError, 
+            ValueError, 
+            AttributeError,
+            KeyError):
+        my_err=sys.exc_info()
+        logger.log(2,"Could not execute command; check username/password. Details: %s %s" %
+                   (my_err[0],my_err[1]))
+        sys.exit(1)
+    for h in d:
+        _mylist = d[h]
+        returnbuf = None
+        returnebuf = None
+        try:
+            returncode = int(_mylist[0])
+            returnbuf = unicode(_mylist[1],'iso8859-1')
+            returnebuf = unicode(_mylist[2],'iso8859-1')
+        except:
+            returncode = 256
+            returnbuf = "exception returned from thread"
+            returnebuf = "exception returned from thread"
+        if (NORESULTS == 0):
+            print "%s: %d" % (h, returncode)
+        logger.log(1, "%s: %d" % (h, returncode))
+        if (PFX_PER_HOST != None):
+            ofp=open("%s:%s.stdout" % (PFX_PER_HOST,h), "w")
+            ofp.write("%s\n" % (returnbuf))
+            ofp.close()
+            efp=open("%s:%s.stderr" % (PFX_PER_HOST,h), "w")
+            efp.write("%s\n" % (returnebuf))
+            efp.close()
+        if (QUIET == 0):
+            print "%s: %s" % (h,returnbuf)
+            if (SHOW_STDERR == 1):
+                print "%s [stderr]: %s" % (h,returnebuf)
+        logger.log(1, "%s: %s" % (h,returnbuf))
+        logger.log(1, "%s [stderr]: %s" % (h,returnebuf))
+else:
+    # we are copying files
+    if ((COPYDIRECTION == 'get') and (SUDO == 1)):
+        logger.log(2, "SUDO cannot apply to 'get' - proceeding without it.")
+    try:
+        d = execute(runSFTP)
+    except (OSError, 
+            RuntimeError, 
+            TypeError, 
+            ValueError, 
+            AttributeError,
+            KeyError):
+        logger.log(2,"Could not copy files; check username/password/paths.")
+        sys.exit(1)
+    for h in d:
+        returncode = d[h]
+        print "%s: %d" % (h, returncode)
+        logger.log(1, "%s: %d" % (h, returncode))
+
